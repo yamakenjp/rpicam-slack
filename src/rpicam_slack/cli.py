@@ -258,6 +258,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
+    logging.getLogger("PIL").setLevel(logging.WARNING)  # Pillow logs every EXIF tag at DEBUG
     try:
         return int(args.func(args))
     except ConfigError as exc:

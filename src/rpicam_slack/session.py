@@ -307,6 +307,7 @@ class CaptureSession:
                 self._fail("camera", str(exc), deadline)
                 return EXIT_CAMERA
 
+            now = d.wall()  # the moment the picture was taken (the run may have started a minute ago)
             total = result.total_exposure_s or planned.total
             log.info("final image: luma %.0f (target %.0f)%s", stats.luma,
                      effective_target(cfg.exposure), ", time-limited" if degraded else "")  # fmt: skip
