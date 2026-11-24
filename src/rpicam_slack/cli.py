@@ -30,7 +30,7 @@ from .config import (
 )
 from .exif import make_embedder
 from .exposure import plan_exposure
-from .focus import focus_scan, recommend, scan_positions
+from .focus import focus_scan, recommend, scan_positions, spread
 from .session import EXIT_CAMERA, EXIT_CONFIG, EXIT_OK, Deps, run_locked, test_shot
 from .slack import SlackUploader
 from .state import Spool, StateStore
@@ -131,7 +131,18 @@ def cmd_focus_scan(args: argparse.Namespace) -> int:
         print(f"{position:>14.2f}  {'-' if fom is None else f'{fom:.1f}'}")
     best = recommend(results)
     if best is None:
-        print("no usable result", file=sys.stderr)
+        variation = spread(results)
+        if variation is None:
+            print("no usable result", file=sys.stderr)
+        else:
+            print(
+                f"\nthe focus figure hardly changes with the lens position (spread {variation:.1%}), "
+                "so no position can be recommended.\n"
+                "In the dark, or on a plain surface, it is mostly noise. Run focus-scan again in "
+                "daylight, pointing at the real scene.\n"
+                "Keep the current lens_position until then.",
+                file=sys.stderr,
+            )
         return EXIT_CAMERA
     print(f"\nrecommended: put this in camera.local.toml\n\n[camera]\nlens_position = {best:g}")
     return EXIT_OK

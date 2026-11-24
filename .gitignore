@@ -9,3 +9,6 @@ dist/
 camera.local.toml
 slack_option
 .slack_option
+.DS_Store
+*.jpg
+*.jpeg
