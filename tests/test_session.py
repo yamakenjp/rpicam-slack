@@ -206,3 +206,11 @@ def test_a_failed_upload_does_not_forget_the_exposure(rig):
 def test_a_configured_temporary_directory_is_created(rig, tmp_path):
     r = rig(DAY, paths={"tmp_dir": str(tmp_path / "does" / "not" / "exist")})
     assert run(r) == EXIT_OK
+
+
+def test_a_longer_preview_for_long_exposures_stays_within_the_budget(rig):
+    r = rig(NIGHT, exposure={"final_preview_frames": 1.5}, budget={"max_total_s": 150})
+    assert run(r) == EXIT_OK  # FakeCamera fails the test if a shot would exceed its timeout
+    final = r.camera.shots[-1]
+    assert final.preview_ms == round(1.5 * final.shutter_us / 1000)
+    assert final.preview_ms > r.cfg.exposure.final_preview_ms

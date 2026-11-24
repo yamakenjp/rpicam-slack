@@ -148,3 +148,22 @@ def max_shutter_for(
     n = budget.frames_per_shot if frames is None else frames
     spare = remaining_s - budget.overhead_s - (preview_ms or 0) / 1000
     return spare / n if spare > 0 else 0.0
+
+
+def final_preview_ms(cfg: ExposureConfig, shutter_s: float) -> int:
+    """Preview time before the final shot: a floor, or several frame times for long exposures."""
+    return max(cfg.final_preview_ms, round(cfg.final_preview_frames * shutter_s * 1000))
+
+
+def max_final_shutter_for(
+    remaining_s: float, cfg: ExposureConfig, budget: BudgetConfig, frames: float | None = None
+) -> float:
+    """The longest final shutter whose cost (preview included) fits into ``remaining_s``."""
+    n = budget.frames_per_shot if frames is None else frames
+    spare = remaining_s - budget.overhead_s
+    if spare <= 0:
+        return 0.0
+    scaled = spare / (n + cfg.final_preview_frames)  # the preview grows with the shutter
+    if cfg.final_preview_frames * scaled * 1000 >= cfg.final_preview_ms:
+        return scaled
+    return max(0.0, (spare - cfg.final_preview_ms / 1000) / n)  # the preview floor applies

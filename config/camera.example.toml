@@ -27,6 +27,9 @@ max_shutter_s = 12.0
 preferred_gain = 2.0      # ゲインはまず 1.0、次にこの値まで。それ以上はシャッターを延ばす
 max_gain = 16.0
 min_shutter_us = 500
+# 長時間露光の色味が不安定なとき: プレビューをシャッター x この回数 (秒) 回し、ホワイトバランスを収束させる。
+# 0 = 無効 (既定)。使うなら 1.5 程度から。時間がかかるので [budget] max_total_s も増やすこと。
+final_preview_frames = 0.0
 
 # テスト撮影は速さ優先 (短いシャッター + 高いゲイン)。
 test_max_shutter_s = 0.5

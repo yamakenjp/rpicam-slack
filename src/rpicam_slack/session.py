@@ -27,9 +27,10 @@ from .exposure import (
     ImageStats,
     command_timeout_s,
     effective_target,
+    final_preview_ms,
     is_converged,
     label,
-    max_shutter_for,
+    max_final_shutter_for,
     measure_image,
     next_total,
     plan_exposure,
@@ -146,7 +147,9 @@ class CaptureSession:
             need = cost + b.upload_reserve_s
             if trials and total is not None:  # a final shot must still fit afterwards
                 final_guess = plan_exposure(total, ex, max_shutter_s=ex.max_shutter_s)
-                need += shot_cost_s(final_guess.shutter_s, ex.final_preview_ms, b, self._frames())
+                need += shot_cost_s(
+                    final_guess.shutter_s, final_preview_ms(ex, final_guess.shutter_s), b, self._frames()
+                )
             if need > self._remaining(deadline):
                 log.warning("not enough time budget for another test; using what we have")
                 break
@@ -190,14 +193,16 @@ class CaptureSession:
         planned = plan_exposure(final_total, ex, max_shutter_s=ex.max_shutter_s)
         frames = self._frames()
         usable = self._remaining(deadline) - b.upload_reserve_s
-        cost = shot_cost_s(planned.shutter_s, ex.final_preview_ms, b, frames)
+        preview_ms = final_preview_ms(ex, planned.shutter_s)
+        cost = shot_cost_s(planned.shutter_s, preview_ms, b, frames)
         degraded = False
         if cost > usable:
-            allowed = max_shutter_for(usable, ex.final_preview_ms, b, frames)
+            allowed = max_final_shutter_for(usable, ex, b, frames)
             if allowed < ex.min_shutter_s:
                 raise CameraError("time budget exhausted before the final shot")
             planned = plan_exposure(final_total, ex, max_shutter_s=allowed)
-            cost = shot_cost_s(planned.shutter_s, ex.final_preview_ms, b, frames)
+            preview_ms = final_preview_ms(ex, planned.shutter_s)
+            cost = shot_cost_s(planned.shutter_s, preview_ms, b, frames)
             degraded = True
             log.warning(
                 "final shot shortened to %s (gain %.2f) to fit the time budget",
@@ -209,7 +214,7 @@ class CaptureSession:
 
         shot = Shot(
             "final", cfg.camera.width, cfg.camera.height, cfg.camera.quality,
-            shutter_us=planned.shutter_us, gain=planned.gain, preview_ms=ex.final_preview_ms,
+            shutter_us=planned.shutter_us, gain=planned.gain, preview_ms=preview_ms,
             lens_position=cfg.camera.lens_position,
             autofocus_on_capture=cfg.camera.lens_position is None,
         )  # fmt: skip
@@ -224,7 +229,7 @@ class CaptureSession:
     def _learn_frame_ratio(self, result: ShotResult, planned: Exposure) -> None:
         if planned.shutter_s < 1.0:
             return
-        preview = self.cfg.exposure.final_preview_ms / 1000
+        preview = final_preview_ms(self.cfg.exposure, planned.shutter_s) / 1000
         ratio = min(max((result.elapsed_s - preview) / planned.shutter_s, 1.0), 30.0)
         old = self.state.frame_ratio
         self.state.frame_ratio = ratio if old == 0 else 0.5 * old + 0.5 * ratio

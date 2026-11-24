@@ -120,3 +120,25 @@ def test_max_shutter_for_inverts_the_cost_model():
     shutter = max_shutter_for(30.0, 2000, budget)
     assert shot_cost_s(shutter, 2000, budget) == pytest.approx(30.0)
     assert max_shutter_for(1.0, 2000, budget) == 0.0
+
+
+def test_final_preview_scales_with_the_shutter_when_enabled():
+    from rpicam_slack.exposure import final_preview_ms
+
+    off = ExposureConfig()
+    assert final_preview_ms(off, 10.0) == 2000  # default: the fixed floor only
+    on = ExposureConfig(final_preview_frames=1.5)
+    assert final_preview_ms(on, 10.0) == 15000
+    assert final_preview_ms(on, 0.01) == 2000  # short exposures keep the floor
+
+
+def test_max_final_shutter_accounts_for_the_growing_preview():
+    from rpicam_slack.exposure import final_preview_ms, max_final_shutter_for
+
+    budget = BudgetConfig()
+    for frames in (0.0, 1.5):
+        cfg = ExposureConfig(final_preview_frames=frames)
+        shutter = max_final_shutter_for(60.0, cfg, budget)
+        cost = shot_cost_s(shutter, final_preview_ms(cfg, shutter), budget)
+        assert cost == pytest.approx(60.0, abs=0.01)  # the preview is rounded to whole ms
+    assert max_final_shutter_for(1.0, ExposureConfig(), budget) == 0.0

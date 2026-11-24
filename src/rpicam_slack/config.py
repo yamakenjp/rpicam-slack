@@ -94,6 +94,9 @@ class ExposureConfig:
     preferred_gain: float = 2.0  # lengthen the shutter before raising gain above this
     max_gain: float = 16.0
     final_preview_ms: int = 2000
+    # Long exposures: let the preview run for this many frame times so auto white balance can
+    # settle (it needs several frames; at a 10 s shutter 2 s of preview is only one frame). 0 = off.
+    final_preview_frames: float = 0.0
     # --- model ---
     gamma: float = 2.0  # luma ~ exposure ** (1 / gamma)
     step_limit: float = 32.0  # largest exposure change between two shots
@@ -115,6 +118,7 @@ class ExposureConfig:
         _check(self.min_shutter_us >= 1, "[exposure] min_shutter_us must be >= 1")
         _check(self.comfortable_shutter_s > 0, "[exposure] comfortable_shutter_s must be > 0")
         _check(0 <= self.final_preview_ms <= 30000, "[exposure] final_preview_ms must be 0..30000")
+        _check(0.0 <= self.final_preview_frames <= 10.0, "[exposure] final_preview_frames must be 0..10")
         _check(
             self.min_shutter_s <= self.comfortable_shutter_s <= self.max_shutter_s,
             "[exposure] need min_shutter_us <= comfortable_shutter_s <= max_shutter_s",
