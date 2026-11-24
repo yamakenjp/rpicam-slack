@@ -1,0 +1,56 @@
+# 全カメラ共通の設定 (~/.config/rpicam-slack/camera.toml)。
+# ここに書かないキーは既定値になる。未知のキーはエラーになる (打ち間違いの検出)。
+# 機体ごとに違う値 (レンズ位置など) は camera.local.toml に書く。
+
+# Slack に出すカメラ名。省略するとホスト名。
+# name = "cam1"
+
+[camera]
+width = 2304
+height = 1296
+quality = 92
+hdr = "auto"          # off | auto | sensor | single-exp
+denoise = "cdn_hq"    # auto | off | cdn_off | cdn_fast | cdn_hq
+metering = "average"  # centre | spot | average | matrix | custom
+awb = "auto"
+# extra_args = ["--vflip"]   # rpicam-still にそのまま渡す追加引数
+
+[exposure]
+# 何を「適正」とするか。画像の平均輝度 (0..255) がこの値に近づくまで測る。
+target_luma = 115.0
+tolerance = 12.0          # 目標との差がこの範囲なら収束とみなす
+ev = 0.0                  # 明るさの補正 (段)。+1 で約 2 倍明るく、-1 で暗く
+max_tests = 4             # テスト撮影の最大回数 (1 回で収束すれば 1 回で済む)
+
+# 最終撮影の限界。夜は長秒露光 → それでも足りなければゲインを上げる。
+max_shutter_s = 12.0
+preferred_gain = 2.0      # ゲインはまず 1.0、次にこの値まで。それ以上はシャッターを延ばす
+max_gain = 16.0
+min_shutter_us = 500
+
+# テスト撮影は速さ優先 (短いシャッター + 高いゲイン)。
+test_max_shutter_s = 0.5
+state_max_age_min = 60    # 直近の露出がこの分数より新しければ、そこから測り始める
+
+# {profile} (day / twilight / night) の境目。シャッター秒 x ゲイン の値で決まる。
+day_max_s = 0.02
+twilight_max_s = 0.5
+
+[budget]
+# 1 回の実行の持ち時間。カメラのタイムアウトはすべてここから計算する。
+max_total_s = 110.0
+upload_reserve_s = 30.0   # 投稿のために残しておく時間
+frames_per_shot = 5.0     # 手動露出の静止画は約この枚数分のフレーム時間がかかる (実測で自動補正)
+
+[slack]
+option_file = "~/.config/rpicam-slack/slack_option"   # 従来の .slack_option と同じ形式
+alert_after_failures = 2  # この回数連続で失敗したら Slack に警告を投稿
+alert_min_interval_min = 60
+alert_recovery = true     # 復旧したら一度だけ知らせる
+
+[paths]
+state_dir = "~/.local/state/rpicam-slack"
+spool_max_files = 24      # 投稿できなかった画像を最大これだけ保存し、次回に再送する
+
+[output]
+embed_exif = true         # 撮影条件を EXIF に書く (ExifTool がなければ自動でスキップ)

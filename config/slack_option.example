@@ -1,0 +1,10 @@
+# 従来の .slack_option と同じ形式 (そのまま流用できる)。権限は chmod 600 にすること。
+SLACK_TOKEN=xoxb-replace-with-your-bot-token
+CHANNEL=C0123456789
+
+# 使えるフィールド: {timestamp} {profile} {camera} {shutter} {gain} {luma} {tests} {lux}
+COMMENT_TEMPLATE=Photo taken at {timestamp}! profile={profile}
+
+# 別名も使える:
+# SLACK_BOT_TOKEN=xoxb-...
+# SLACK_CHANNEL_ID=C0123456789

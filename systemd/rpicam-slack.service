@@ -1,0 +1,17 @@
+[Unit]
+Description=Measure exposure, capture a still and post it to Slack
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/rpicam-slack
+ExecStart=/home/pi/rpicam-slack/.venv/bin/rpicam-slack capture
+# 75 (EX_TEMPFAIL) は「投稿だけ失敗した。画像は保存済みで次回に再送する」という意味。
+# 失敗扱いにしない (連続失敗は Slack への警告と `rpicam-slack status` で分かる)。
+SuccessExitStatus=75
+UMask=0077
+# [budget] max_total_s (既定 110 秒) より十分に長くする。
+TimeoutStartSec=180s

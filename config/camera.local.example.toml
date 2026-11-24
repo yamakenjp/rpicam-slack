@@ -1,0 +1,14 @@
+# 機体ごとの設定 (~/.config/rpicam-slack/camera.local.toml)。camera.toml の上に重ねられる。
+# 書いたキーだけが上書きされる。
+
+name = "cam2"
+
+[camera]
+# レンズ位置 (ジオプター。0.0 = 無限遠、2.0 = 約 0.5 m)。
+# `rpicam-slack focus-scan` で求めた値を入れる。省略すると撮影のたびにオートフォーカス。
+lens_position = 4.5
+
+# 暗い場所の機体だけ、夜の上限を長くしたい場合の例:
+# [exposure]
+# max_shutter_s = 12.0
+# ev = 0.3

@@ -1,0 +1,11 @@
+__pycache__/
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+# 実機の設定・秘密情報はリポジトリに入れない
+camera.local.toml
+slack_option
+.slack_option

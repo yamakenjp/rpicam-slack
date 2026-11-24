@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rpicam-slack"
+version = "0.1.0"
+description = "Auto-exposure still capture for Raspberry Pi cameras, posted to Slack"
+readme = "README.txt"
+requires-python = ">=3.11"
+dependencies = [
+  "slack-sdk>=3.31,<4",
+  "Pillow>=10",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+rpicam-slack = "rpicam_slack.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
