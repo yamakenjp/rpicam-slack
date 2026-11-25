@@ -1,6 +1,7 @@
 """End-to-end behaviour of one run, against the scene simulator."""
 
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -351,12 +352,219 @@ def test_no_resend_starts_without_the_time_for_one_upload(rig, tmp_path, monkeyp
 
     def slow(path, comment, filename, *, deadline):
         upload(path, comment, filename, deadline=deadline)
-        r.clock.advance(deadline - r.clock() - r.cfg.slack.timeout_s)  # less than timeout_s + 5 is left
+        r.clock.advance(deadline - r.clock() - 30)  # it took over a minute, and 30 s are left
 
     monkeypatch.setattr(r.uploader, "upload", slow)
     assert run(r) == EXIT_OK
     assert len(r.uploader.uploads) == 1  # only the fresh picture
     assert [item.filename for item in r.spool.pending()] == ["old.jpg"]
+
+
+def test_a_quick_upload_lets_the_backlog_drain_in_a_tight_budget(rig, tmp_path, monkeypatch):
+    r = rig(DAY, budget={"max_total_s": 40.0, "upload_reserve_s": 20.0})
+    image = tmp_path / "image.jpg"
+    image.write_bytes(b"frame")
+    r.spool.add(image, "old", "old.jpg", 1)
+    upload = r.uploader.upload
+    left = []
+
+    def quick(path, comment, filename, *, deadline):
+        r.clock.advance(3)  # each upload takes 3 s
+        upload(path, comment, filename, deadline=deadline)
+        left.append(deadline - r.clock())
+
+    monkeypatch.setattr(r.uploader, "upload", quick)
+    assert run(r) == EXIT_OK
+    assert left[0] < r.cfg.slack.timeout_s + 5  # less than a whole timeout was left after the fresh one
+    assert r.uploader.uploads[-1] == ("old.jpg", "[late] old")
+    assert r.spool.pending() == []
+
+
+@pytest.mark.parametrize(
+    "durations, left, resent",
+    [
+        ([20.0, 1.0], 39.0, 0),  # twice the 20 s upload is 40 s
+        ([20.0, 1.0], 41.0, 1),
+        ([0.5, 0.5], 4.0, 0),  # never with less than five seconds
+        ([0.5, 0.5], 6.0, 1),
+        ([1.0, 10.0, 1.0], 25.0, 1),  # the 10 s re-send leaves 15 s: less than twice the slowest upload
+        ([10.0, 1.0, 1.0], 20.5, 1),  # a quick re-send does not make the 10 s upload forgotten
+    ],
+)
+def test_a_resend_needs_twice_the_slowest_upload_and_at_least_five_seconds(
+    rig, tmp_path, monkeypatch, durations, left, resent
+):
+    """Upload i takes durations[i] s, and ``left`` s of the budget remain after the fresh one."""
+    r = rig(DAY)
+    image = tmp_path / "image.jpg"
+    image.write_bytes(b"frame")
+    for i in range(len(durations) - 1):  # one waiting picture for each re-send that is timed
+        r.spool.add(image, f"old{i}", f"old{i}.jpg", i + 1)
+    upload, add = r.uploader.upload, r.spool.add
+    deadline = r.clock() + r.cfg.budget.max_total_s
+    calls = []
+
+    def staged(*args, **kwargs):  # the run stages the fresh picture just before it uploads it
+        item = add(*args, **kwargs)
+        r.clock.now = deadline - left - durations[0]
+        return item
+
+    def timed(path, comment, filename, *, deadline):
+        r.clock.advance(durations[len(calls)])
+        calls.append(filename)
+        upload(path, comment, filename, deadline=deadline)
+
+    monkeypatch.setattr(r.spool, "add", staged)
+    monkeypatch.setattr(r.uploader, "upload", timed)
+    assert run(r) == EXIT_OK
+    assert len(calls) - 1 == resent
+
+
+def test_repeated_rate_limits_still_raise_the_alert(rig, monkeypatch):
+    r = rig(DAY)
+
+    def rate_limit(*args, **kwargs):
+        raise UploadError("429", retry_after_s=30)
+
+    monkeypatch.setattr(r.uploader, "upload", rate_limit)
+    assert run(r) == EXIT_UPLOAD_DEFERRED
+    r.advance(900)  # the 30 s wait is long over, and Slack answers 429 again
+    assert run(r) == EXIT_UPLOAD_DEFERRED
+    assert len(r.uploader.alerts) == 1 and "2 run(s) in a row" in r.uploader.alerts[0]
+
+
+def test_a_wait_that_ends_during_the_capture_does_not_silence_the_alert(rig, monkeypatch):
+    r = rig(DAY)
+    asked = []
+
+    def rate_limit(*args, **kwargs):
+        asked.append(r.clock())
+        raise UploadError("429", retry_after_s=901)
+
+    monkeypatch.setattr(r.uploader, "upload", rate_limit)
+    assert run(r) == EXIT_UPLOAD_DEFERRED
+    r.advance(900)  # one second of the wait is left when the next run starts, none when it posts
+    assert run(r) == EXIT_UPLOAD_DEFERRED
+    assert len(asked) == 2  # Slack was asked again and answered 429 again
+    assert len(r.uploader.alerts) == 1 and "2 run(s) in a row" in r.uploader.alerts[0]
+
+
+def test_a_failed_upload_that_used_up_the_budget_still_raises_the_alert(rig, monkeypatch):
+    r = rig(NIGHT)
+    room = []
+
+    def stalled(path, comment, filename, *, deadline):
+        r.clock.advance(max(0.0, deadline - r.clock()))  # the JPEG does not get through: the budget is gone
+        raise UploadError("upload failed after 3 attempts: TimeoutError: timed out")
+
+    def alert(text, *, deadline):
+        room.append(deadline - r.clock())
+        r.uploader.alerts.append(text)
+        return True
+
+    monkeypatch.setattr(r.uploader, "upload", stalled)
+    monkeypatch.setattr(r.uploader, "alert", alert)
+    for _ in range(3):
+        assert run(r) == EXIT_UPLOAD_DEFERRED
+        r.advance(900)
+    assert len(r.uploader.alerts) == 1 and "2 run(s) in a row" in r.uploader.alerts[0]
+    assert room == [pytest.approx(5.0)]  # the short message gets time of its own
+
+
+def test_an_alert_with_budget_left_keeps_the_deadline_of_the_run(rig, monkeypatch):
+    r = rig(DAY)
+    r.camera.fail_runs = 1_000
+    room = []
+
+    def alert(text, *, deadline):
+        room.append(deadline - r.clock())
+        return True
+
+    monkeypatch.setattr(r.uploader, "alert", alert)
+    assert run(r) == EXIT_CAMERA
+    r.advance(900)
+    started = r.clock()
+    assert run(r) == EXIT_CAMERA
+    left = r.cfg.budget.max_total_s - (r.clock() - started)
+    assert left > 60 and room == [pytest.approx(left)]  # neither cut to five seconds nor given five more
+
+
+def test_a_file_that_cannot_be_set_aside_does_not_block_the_queue(rig, tmp_path, monkeypatch):
+    r = rig(DAY)
+    image = tmp_path / "image.jpg"
+    image.write_bytes(b"frame")
+    for i, filename in enumerate(["refused.jpg", "ok.jpg"]):
+        r.spool.add(image, filename, filename, i)
+    upload = r.uploader.upload
+
+    def refuse(path, comment, filename, *, deadline):
+        if filename == "refused.jpg":
+            raise UploadFileError("file rejected: slack error file_type_not_allowed", permanent=True)
+        upload(path, comment, filename, deadline=deadline)
+
+    def read_only(item):
+        raise OSError(30, "Read-only file system")
+
+    monkeypatch.setattr(r.uploader, "upload", refuse)
+    monkeypatch.setattr(r.spool, "reject", read_only)
+    assert run(r) == EXIT_OK
+    assert r.uploader.uploads[-1] == ("ok.jpg", "[late] ok.jpg")
+
+
+def test_a_cleanup_error_before_the_copy_does_not_cost_the_fresh_picture(rig, monkeypatch):
+    r = rig(DAY)
+
+    def broken(**kwargs):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(r.spool, "prune", broken)
+    r.uploader.fail_uploads = 1
+    assert run(r) == EXIT_UPLOAD_DEFERRED  # the fresh picture is in the spool all the same
+    assert [item.filename.startswith("cam-test_") for item in r.spool.pending()] == [True]
+
+
+def test_a_file_that_cannot_be_deleted_does_not_stop_the_spool_from_being_trimmed(rig, tmp_path, monkeypatch):
+    r = rig(DAY, paths={"spool_max_files": 3})
+    image = tmp_path / "image.jpg"
+    image.write_bytes(b"frame")
+    r.spool.reject(r.spool.add(image, "refused", "refused.jpg", 2))
+    unlink = Path.unlink
+
+    def stuck(self, missing_ok=False):
+        if self.name.startswith("2-"):  # the refused image cannot be deleted
+            raise OSError(5, "Input/output error")
+        return unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", stuck)
+    r.uploader.fail_uploads = 99
+    for _ in range(8):
+        assert run(r) == EXIT_UPLOAD_DEFERRED
+        r.advance(900)
+    assert len(r.spool.pending()) <= 3
+
+
+def test_a_failed_upload_keeps_the_fresh_picture_even_when_the_backlog_looks_newer(rig, tmp_path):
+    r = rig(DAY, paths={"spool_max_files": 2})
+    image = tmp_path / "image.jpg"
+    image.write_bytes(b"frame")
+    for i in range(2):  # taken while the clock was wrong: their names sort after today's picture
+        r.spool.add(image, f"later{i}", f"later{i}.jpg", 4_000_000_000 + i)
+    r.uploader.fail_uploads = 1
+    assert run(r) == EXIT_UPLOAD_DEFERRED
+    fresh, *backlog = [item.filename for item in r.spool.pending()]
+    assert fresh.startswith("cam-test_") and backlog == ["later1.jpg"]
+
+
+def test_a_long_outage_keeps_the_spool_bounded_and_the_newest_picture(rig):
+    r = rig(DAY, paths={"spool_max_files": 3})
+    r.uploader.fail_uploads = 99
+    for _ in range(8):
+        assert run(r) == EXIT_UPLOAD_DEFERRED
+        pending = r.spool.pending()
+        newest = max(path.name for path in r.spool.directory.glob("*.jpg"))  # names start with the time
+        assert len(pending) <= 3 and newest in [item.image.name for item in pending]
+        assert len(list(r.spool.directory.iterdir())) <= 6
+        r.advance(900)
 
 
 def test_waiting_for_slack_is_capped_and_raises_no_alert(rig, monkeypatch):

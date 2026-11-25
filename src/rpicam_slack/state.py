@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import time
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass, fields
@@ -27,6 +28,15 @@ def _fsync(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _discard(*paths: Path) -> None:
+    """Delete what can be deleted: one stuck file must not keep the rest of the spool from being trimmed."""
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("could not delete %s: %s", path.name, exc)
 
 
 @dataclass
@@ -98,7 +108,10 @@ class Spool:
         self.directory.mkdir(parents=True, exist_ok=True)
         if not prune:
             # A previous process may have stopped with its in-flight slot occupied.
-            self.prune()
+            try:
+                self.prune()
+            except OSError as exc:  # tidying up must never cost the fresh picture its copy
+                log.warning("could not trim the spool: %s", exc)
             self.sweep()
         # The sidecar is the commit marker. Readers see the pair only after the JPEG is complete.
         target = self.directory / f"{int(taken_epoch)}-{uuid4().hex}.jpg"
@@ -110,37 +123,54 @@ class Spool:
             tmp.write_text(json.dumps({"comment": comment, "filename": filename}), encoding="utf-8")
             _fsync(tmp)
             os.replace(tmp, meta)
-            _fsync(self.directory)  # the rename itself must reach the disk too
         except OSError:
             tmp.unlink(missing_ok=True)
-            meta.unlink(missing_ok=True)
             target.unlink(missing_ok=True)
             raise
+        try:
+            _fsync(self.directory)  # the rename itself should reach the disk too
+        except OSError as exc:  # not every filesystem can do this, and the pair is complete either way
+            log.warning("could not flush the spool directory: %s", exc)
         if prune:
             self.prune(keep=target)
         return SpoolItem(target, meta, comment, filename)
 
     def pending(self) -> list[SpoolItem]:
-        if not self.directory.is_dir():
-            return []
+        return self._scan()[0]
+
+    def _scan(self) -> tuple[list[SpoolItem], set[Path]]:
+        """The readable pairs in order, and the files of entries that could not be read just now."""
         items: list[SpoolItem] = []
+        unreadable: set[Path] = set()
+        if not self.directory.is_dir():
+            return items, unreadable
         for meta in sorted(self.directory.glob("*.json")):
             image = meta.with_suffix("")
             try:
-                if not image.is_file():
+                # Not is_file(): from Python 3.14 on it hides every error, and a JPEG that cannot be
+                # examined just now must not be taken for a missing one.
+                if not stat.S_ISREG(image.stat().st_mode):
                     continue
                 info = json.loads(meta.read_text(encoding="utf-8"))
                 items.append(SpoolItem(image, meta, str(info["comment"]), str(info["filename"])))
-            except (OSError, ValueError, KeyError, TypeError) as exc:
+            except FileNotFoundError:
+                continue  # no JPEG (or the pair has just been removed): a leftover at most
+            except OSError as exc:  # may well be readable next time: this is not a damaged entry
                 log.warning("cannot read spool entry %s: %s", meta, exc)
-        return items
+                unreadable.update((image, meta))
+            except (ValueError, KeyError, TypeError) as exc:
+                log.warning("cannot read spool entry %s: %s", meta, exc)
+        return items, unreadable
 
     def remove(self, item: SpoolItem) -> None:
         item.meta.unlink(missing_ok=True)
         item.image.unlink(missing_ok=True)
 
     def reject(self, item: SpoolItem) -> None:
-        """Take an image that can never be sent out of the queue; sweep() deletes it later."""
+        """Take an image that can never be sent out of the queue; sweep() deletes it a day later."""
+        with contextlib.suppress(OSError):  # the day counts from now, however long the image had waited
+            os.utime(item.meta)
+            os.utime(item.image)
         os.replace(item.meta, item.meta.with_suffix(".rejected"))
 
     def sweep(self, now: float | None = None) -> None:
@@ -154,7 +184,8 @@ class Spool:
             return
         cutoff = (time.time() if now is None else now) - STALE_S
         try:
-            keep = {path for item in self.pending() for path in (item.image, item.meta)}
+            items, keep = self._scan()
+            keep.update(path for item in items for path in (item.image, item.meta))
             for path in self.directory.iterdir():
                 if path not in keep and path.is_file() and path.stat().st_mtime < cutoff:
                     log.warning("removing stale spool file %s", path.name)
@@ -166,10 +197,14 @@ class Spool:
         if self.max_files <= 0:
             return
         items = self.pending()
+        # Rejected images only wait for sweep(): they give way first when the directory is over its limit.
+        rejected = sorted(self.directory.glob("*.rejected")) if self.directory.is_dir() else []
+        for marker in rejected[: max(0, len(items) + len(rejected) - self.max_files)]:
+            _discard(marker.with_suffix(""), marker)
         oldest = [item for item in items if item.image != keep]
         for item in oldest[: max(0, len(items) - self.max_files)]:
             log.warning("spool full; dropping oldest image %s", item.filename)
-            self.remove(item)
+            _discard(item.meta, item.image)
 
 
 @contextlib.contextmanager

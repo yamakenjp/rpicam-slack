@@ -1,9 +1,12 @@
 import json
+import os
+import time
 
 import pytest
 
 from rpicam_slack.cli import main
-from rpicam_slack.state import locked
+from rpicam_slack.session import LOCK_WAIT_S
+from rpicam_slack.state import STALE_S, locked
 
 
 def write_config(tmp_path, fake_command, extra=""):
@@ -95,6 +98,45 @@ def test_focus_scan_respects_the_capture_lock(tmp_path, fake_rpicam, monkeypatch
     with locked(tmp_path / "state" / "lock") as acquired:
         assert acquired
         assert main(["focus-scan", "--config", config]) == 1
+
+
+def test_capture_waits_for_the_lock_and_focus_scan_shoots_under_it(tmp_path, fake_rpicam, monkeypatch):
+    config = write_config(tmp_path, fake_rpicam)
+    seen = {}
+
+    def fake_run_locked(cfg, deps, wait_s=0.0):
+        seen["wait_s"] = wait_s
+        return 0
+
+    def fake_focus_scan(cfg, camera, positions, tmp, **kwargs):
+        seen["lock"] = kwargs.get("lock")
+        return [(position, 1500.0 if position == 1.0 else 1000.0) for position in positions]
+
+    monkeypatch.setattr("rpicam_slack.cli.run_locked", fake_run_locked)
+    monkeypatch.setattr("rpicam_slack.cli.focus_scan", fake_focus_scan)
+    assert main(["capture", "--config", config, "--no-upload"]) == 0
+    assert main(["focus-scan", "--config", config, "--start", "0", "--end", "2", "--step", "1"]) == 0
+    assert seen == {"wait_s": LOCK_WAIT_S, "lock": tmp_path / "state" / "lock"}
+    assert LOCK_WAIT_S == 30.0  # the README promises 30 seconds
+
+
+def test_status_never_changes_the_spool(tmp_path, fake_rpicam, capsys):
+    config = write_config(tmp_path, fake_rpicam)
+    spool = tmp_path / "state" / "spool"
+    spool.mkdir(parents=True)
+    # An orphan JPEG, a damaged pair, a half-written sidecar and a rejected pair.
+    for name in ["1-a.jpg", "2-b.jpg", "2-b.jpg.json", "3-c.jpg.tmp", "4-d.jpg", "4-d.jpg.rejected"]:
+        (spool / name).write_text("{")
+    for i in range(26):  # two more than spool_max_files: a status that tidied up would drop them
+        (spool / f"{100 + i}-waiting.jpg").write_text("image")
+        (spool / f"{100 + i}-waiting.jpg.json").write_text('{"comment": "c", "filename": "f.jpg"}')
+    long_ago = time.time() - STALE_S - 60
+    for path in spool.iterdir():
+        os.utime(path, (long_ago, long_ago))
+    before = sorted(path.name for path in spool.iterdir())
+    assert main(["status", "--config", config]) == 0
+    assert "spooled uploads:      26" in capsys.readouterr().out
+    assert sorted(path.name for path in spool.iterdir()) == before
 
 
 @pytest.mark.parametrize("template", ["{gain:.2f}", "{}", "{timestamp", "{camera!z}"])

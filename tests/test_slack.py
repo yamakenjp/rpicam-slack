@@ -145,6 +145,14 @@ def test_retry_after_is_found_whatever_the_case_of_the_header_name(image):
     assert sleeps == [9.0]
 
 
+def test_a_rate_limit_with_unusable_headers_waits_the_default_time(image):
+    limited = api_error("ratelimited", 429)
+    limited.response.headers = ["Retry-After: 9"]  # not a mapping
+    sleeps: list[float] = []
+    uploader(FakeClient([limited]), sleeps).upload(image, "c", "f.jpg")
+    assert sleeps == [2.0]
+
+
 def test_at_least_one_attempt_is_required():
     with pytest.raises(ValueError):
         SlackUploader("xoxb-token", "C123", retries=0)
@@ -156,6 +164,7 @@ def test_only_files_that_can_never_be_sent_are_permanent(tmp_path, image):
     refused = FakeClient([api_error("file_type_not_allowed")])
     cases = [
         (refused, image, True),
+        (FakeClient([api_error("file_upload_size_restricted")]), image, True),
         (FakeClient([]), empty, True),
         (FakeClient([]), tmp_path / "no.jpg", False),
     ]
