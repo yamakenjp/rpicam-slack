@@ -349,14 +349,17 @@ def read_option_file(path: Path) -> dict[str, str]:
 
 
 def validate_comment_template(template: str) -> None:
-    for _, field_name, format_spec, _ in Formatter().parse(template):
-        if field_name and field_name not in COMMENT_FIELDS:
-            raise ConfigError(
-                f"COMMENT_TEMPLATE has unsupported field {{{field_name}}} "
-                f"(allowed: {', '.join(sorted(COMMENT_FIELDS))})"
-            )
-        if format_spec and ("{" in format_spec or "}" in format_spec):
-            raise ConfigError("COMMENT_TEMPLATE nested replacement fields are not supported")
+    try:
+        for _, field_name, format_spec, _ in Formatter().parse(template):
+            if field_name is not None and field_name not in COMMENT_FIELDS:
+                allowed = ", ".join(sorted(COMMENT_FIELDS))
+                raise ValueError(f"unsupported field {{{field_name}}} (allowed: {allowed})")
+            if format_spec and ("{" in format_spec or "}" in format_spec):
+                raise ValueError("nested replacement fields are not supported")
+        # CaptureSession passes pre-formatted strings for every field.
+        template.format_map(dict.fromkeys(COMMENT_FIELDS, "1"))
+    except (ValueError, KeyError, IndexError) as exc:
+        raise ConfigError(f"invalid COMMENT_TEMPLATE: {exc}") from exc
 
 
 def read_slack_options(path: Path) -> SlackOptions:

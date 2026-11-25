@@ -31,9 +31,9 @@ from .config import (
 from .exif import make_embedder
 from .exposure import plan_exposure
 from .focus import focus_scan, recommend, scan_positions, spread
-from .session import EXIT_CAMERA, EXIT_CONFIG, EXIT_OK, Deps, run_locked, test_shot
+from .session import EXIT_CAMERA, EXIT_CONFIG, EXIT_OK, LOCK_WAIT_S, Deps, run_locked, test_shot
 from .slack import SlackUploader
-from .state import Spool, StateStore
+from .state import Spool, StateStore, locked
 
 log = logging.getLogger("rpicam_slack")
 
@@ -111,7 +111,7 @@ def cmd_capture(args: argparse.Namespace) -> int:
         embed_exif=make_embedder(cfg.output),
         keep_path=Path(args.keep).expanduser() if args.keep else None,
     )
-    return run_locked(cfg, deps)
+    return run_locked(cfg, deps, LOCK_WAIT_S)
 
 
 # ---------------------------------------------------------------------------------- others
@@ -124,8 +124,15 @@ def cmd_focus_scan(args: argparse.Namespace) -> int:
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
     camera = RpicamStill(cfg.camera)
+    lock = cfg.paths.state_path / "lock"
+    with locked(lock) as acquired:
+        if not acquired:
+            log.error("camera is busy; retry the focus scan after the current capture")
+            return EXIT_CAMERA
+    # The scan takes the lock again for each shot: a capture that the timer starts meanwhile
+    # runs between two shots (it waits LOCK_WAIT_S for that) instead of being skipped.
     with tempfile.TemporaryDirectory(prefix="rpicam-slack-focus-") as tmp:
-        results = focus_scan(cfg, camera, positions, Path(tmp))
+        results = focus_scan(cfg, camera, positions, Path(tmp), lock=lock)
     print(f"{'lens_position':>14}  FocusFoM")
     for position, fom in results:
         print(f"{position:>14.2f}  {'-' if fom is None else f'{fom:.1f}'}")

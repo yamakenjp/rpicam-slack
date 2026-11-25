@@ -1,11 +1,14 @@
 import logging
+import threading
 from pathlib import Path
 
 import pytest
 
 from rpicam_slack.camera import ShotResult
 from rpicam_slack.exposure import ImageStats
-from rpicam_slack.focus import focus_scan, recommend, scan_positions, spread
+from rpicam_slack.focus import LOCK_GAP_S, focus_scan, recommend, scan_positions, spread
+from rpicam_slack.session import ALERT_MIN_S
+from rpicam_slack.state import LOCK_POLL_S, locked
 from tests.conftest import make_config
 
 
@@ -25,6 +28,8 @@ def test_unusable_results():
     assert recommend([]) is None
     assert recommend([(0.0, None), (1.0, None)]) is None
     assert spread([(0.0, 5.0)]) is None
+    assert recommend([(0.0, 0.0), (4.0, 0.0), (8.0, 0.0)]) is None
+    assert recommend([(0.0, None), (4.0, 1200.0)]) is None
 
 
 def test_scan_positions():
@@ -56,3 +61,66 @@ def test_scanning_in_daylight_does_not_warn(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="rpicam_slack.focus"):
         focus_scan(cfg, FocusCamera(), [0.0, 1.0], tmp_path, measure=bright)
     assert caplog.text == ""
+
+
+def test_the_lock_is_held_for_each_shot_and_free_in_between(tmp_path, monkeypatch):
+    cfg = make_config(tmp_path)
+    lock = tmp_path / "lock"
+    seen: list[tuple[str, bool]] = []
+
+    def free() -> bool:
+        with locked(lock) as acquired:
+            return acquired
+
+    class Camera(FocusCamera):
+        def shoot(self, shot, image: Path, *, timeout_s: float) -> ShotResult:
+            seen.append(("shot", free()))
+            return super().shoot(shot, image, timeout_s=timeout_s)
+
+    monkeypatch.setattr("rpicam_slack.focus.time.sleep", lambda seconds: seen.append(("gap", free())))
+    results = focus_scan(cfg, Camera(), [0.0, 1.0, 2.0], tmp_path, lock=lock)
+    assert [fom for _, fom in results] == [2000.0, 2001.0, 2002.0]
+    assert seen == [("shot", False), ("gap", True), ("shot", False), ("gap", True), ("shot", False)]
+    assert LOCK_GAP_S >= 2 * LOCK_POLL_S  # a waiting capture looks at the lock at least twice in the gap
+
+
+def test_a_shot_is_given_up_when_the_camera_stays_busy(tmp_path, monkeypatch):
+    cfg = make_config(tmp_path)
+    lock = tmp_path / "lock"
+    shots, waits = [], []
+
+    class Camera(FocusCamera):
+        def shoot(self, shot, image: Path, *, timeout_s: float) -> ShotResult:
+            shots.append(shot)
+            return super().shoot(shot, image, timeout_s=timeout_s)
+
+    def impatient(path, wait_s):
+        waits.append(wait_s)
+        return locked(path, 0.05)
+
+    monkeypatch.setattr("rpicam_slack.focus.locked", impatient)
+    with locked(lock) as acquired:  # a capture that does not finish in time
+        assert acquired
+        results = focus_scan(cfg, Camera(), [0.0], tmp_path, lock=lock)
+    assert results == [(0.0, None)] and shots == []  # never shoot without the lock
+    # It would have waited for a whole capture, and one that alerts runs ALERT_MIN_S over its budget.
+    assert len(waits) == 1 and waits[0] > cfg.budget.max_total_s + ALERT_MIN_S
+
+
+def test_a_shot_waits_for_a_capture_that_holds_the_lock(tmp_path):
+    cfg = make_config(tmp_path)
+    lock = tmp_path / "lock"
+    holding, release = threading.Event(), threading.Event()
+
+    def capture():
+        with locked(lock):
+            holding.set()
+            release.wait(5)
+
+    thread = threading.Thread(target=capture)
+    thread.start()
+    assert holding.wait(5)
+    threading.Timer(0.2, release.set).start()
+    results = focus_scan(cfg, FocusCamera(), [0.0], tmp_path, lock=lock)
+    thread.join()
+    assert results == [(0.0, 2000.0)]  # not recorded as a failed position
