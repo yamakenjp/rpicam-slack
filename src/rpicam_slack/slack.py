@@ -40,7 +40,10 @@ class UploadError(RuntimeError):
 
 
 class UploadFileError(UploadError):
-    """This particular local file could not be read; other queued files can still be sent."""
+    """This particular file cannot be sent; other queued files still can.
+
+    ``permanent`` is set when trying the same file again cannot help (Slack refused it, or it is empty).
+    """
 
 
 class UploadDeadline(UploadError):
@@ -91,6 +94,8 @@ class SlackUploader:
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        if retries < 1:
+            raise ValueError("retries must be at least 1")
         self._token = token
         self._channel = channel
         self._timeout_s = timeout_s
@@ -132,9 +137,11 @@ class SlackUploader:
         code, status, headers = _api_error(exc)
         if code == "ratelimited" or status == 429:
             try:
-                delay = float(headers.get("Retry-After", headers.get("retry-after", self._retry_wait_s)))
+                # Header names arrive in whatever case the server or a proxy chose.
+                found = [value for name, value in headers.items() if str(name).lower() == "retry-after"]
+                delay = float(found[0]) if found else self._retry_wait_s
                 return delay if math.isfinite(delay) and delay >= 0 else self._retry_wait_s
-            except (TypeError, ValueError):
+            except (AttributeError, TypeError, ValueError):
                 return self._retry_wait_s
         return None
 
@@ -144,8 +151,9 @@ class SlackUploader:
         except OSError as exc:
             raise UploadFileError(f"cannot read {path}: {exc}") from exc
         if not contents:
-            raise UploadFileError(f"empty file: {path}")
+            raise UploadFileError(f"empty file: {path}", permanent=True)
         for attempt in range(1, self._retries + 1):
+            sent = False
             try:
                 with self._client(deadline) as client:
                     client.files_upload_v2(
@@ -155,13 +163,16 @@ class SlackUploader:
                         title=filename,
                         initial_comment=comment,
                     )
+                    sent = True
                 return
             except UploadDeadline:
+                if sent:  # the timer fired after Slack had answered: the upload stands
+                    return
                 raise
             except Exception as exc:
                 code, _, _ = _api_error(exc)
                 if code in {"file_type_not_allowed", "file_upload_size_restricted"}:
-                    raise UploadFileError(f"file rejected: {describe(exc)}") from exc
+                    raise UploadFileError(f"file rejected: {describe(exc)}", permanent=True) from exc
                 if code in PERMANENT_ERRORS:
                     raise UploadError(f"upload rejected: {describe(exc)}", permanent=True) from exc
                 log.warning("upload attempt %d/%d failed: %s", attempt, self._retries, describe(exc))

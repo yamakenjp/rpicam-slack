@@ -47,6 +47,8 @@ EXIT_CONFIG = 2
 EXIT_UPLOAD_FAILED = 3  # upload failed and no durable copy is available for retry
 EXIT_UPLOAD_DEFERRED = 75  # EX_TEMPFAIL: the image is spooled and will be retried
 MAX_SPOOL_FLUSH = 3
+MAX_UPLOAD_WAIT_S = 3600.0  # a Retry-After (or a clock that jumped) never holds uploads back for longer
+LOCK_WAIT_S = 30.0  # how long the timer waits for a focus-scan shot in progress before it gives up
 AE_ASSUMED_SHUTTER_S = 0.07  # auto exposure stays near one frame time
 
 
@@ -263,6 +265,8 @@ class CaptureSession:
             return
         if epoch - self.state.last_alert_epoch < s.alert_min_interval_min * 60:
             return
+        if self._upload_wait_s() > 0:
+            return  # Slack asked us to wait: do not answer with more API calls
         if self.d.uploader.alert(f":warning: {self.cfg.camera_name}: {text}", deadline=deadline):
             self.state.last_alert_epoch = epoch
             self._save_state()
@@ -279,8 +283,15 @@ class CaptureSession:
 
     def _record_retry_after(self, exc: UploadError) -> None:
         if exc.retry_after_s is not None:
-            self.state.upload_not_before_epoch = self.d.wall().timestamp() + exc.retry_after_s
+            wait = min(exc.retry_after_s, MAX_UPLOAD_WAIT_S)
+            self.state.upload_not_before_epoch = self.d.wall().timestamp() + wait
             self._save_state()
+
+    def _upload_wait_s(self) -> float:
+        """Seconds Slack still wants us to wait before the next upload (0: nothing to wait for)."""
+        wait = self.state.upload_not_before_epoch - self.d.wall().timestamp()
+        # More than the cap can only mean that the clock was set back after the wait was recorded.
+        return wait if 0 < wait <= MAX_UPLOAD_WAIT_S else 0.0
 
     def _post(
         self, result: ShotResult, comment: str, filename: str, taken: datetime, deadline: float
@@ -294,7 +305,7 @@ class CaptureSession:
         except OSError as exc:
             log.error("could not stage %s for retry: %s", filename, exc)
         try:
-            wait = self.state.upload_not_before_epoch - d.wall().timestamp()
+            wait = self._upload_wait_s()
             if wait > 0:
                 raise UploadError(f"Slack Retry-After has {wait:.0f}s remaining")
             d.uploader.upload(item.image if item else result.image, comment, filename, deadline=deadline)
@@ -317,12 +328,16 @@ class CaptureSession:
             return
         sent = 0
         for item in self.d.spool.pending():
-            if sent >= MAX_SPOOL_FLUSH or self._remaining(deadline) <= 0:
+            # An upload that is cut off at the deadline may already have reached Slack and would be
+            # sent again next time, so do not start one without the time for it.
+            if sent >= MAX_SPOOL_FLUSH or self._remaining(deadline) < self.cfg.slack.timeout_s + 5:
                 return
             try:
                 uploader.upload(item.image, f"[late] {item.comment}", item.filename, deadline=deadline)
             except UploadFileError as exc:
                 log.warning("skipping spooled image %s: %s", item.filename, exc)
+                if exc.permanent:
+                    self.d.spool.reject(item)  # never sendable: do not offer it to Slack on every run
                 continue
             except UploadError as exc:
                 self._record_retry_after(exc)
@@ -414,9 +429,9 @@ class CaptureSession:
         return EXIT_OK
 
 
-def run_locked(cfg: Config, deps: Deps) -> int:
-    """Run one capture unless another run is in progress (then skip quietly)."""
-    with locked(cfg.paths.state_path / "lock") as acquired:
+def run_locked(cfg: Config, deps: Deps, wait_s: float = 0.0) -> int:
+    """Run one capture unless another run is still in progress after ``wait_s`` (then skip quietly)."""
+    with locked(cfg.paths.state_path / "lock", wait_s) as acquired:
         if not acquired:
             log.warning("another run is in progress; skipping this one")
             return EXIT_OK

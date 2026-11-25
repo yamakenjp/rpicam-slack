@@ -8,12 +8,25 @@ import json
 import logging
 import os
 import shutil
+import time
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from uuid import uuid4
 
 log = logging.getLogger(__name__)
+
+STALE_S = 24 * 3600  # spool leftovers older than this are deleted by Spool.sweep()
+LOCK_POLL_S = 0.05
+
+
+def _fsync(path: Path) -> None:
+    """Flush a file or a directory to the disk, so that it survives a sudden power loss."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 @dataclass
@@ -86,16 +99,21 @@ class Spool:
         if not prune:
             # A previous process may have stopped with its in-flight slot occupied.
             self.prune()
+            self.sweep()
         # The sidecar is the commit marker. Readers see the pair only after the JPEG is complete.
         target = self.directory / f"{int(taken_epoch)}-{uuid4().hex}.jpg"
         meta = target.with_suffix(".jpg.json")
         tmp = meta.with_suffix(".tmp")
         try:
             shutil.copyfile(image, target)
+            _fsync(target)
             tmp.write_text(json.dumps({"comment": comment, "filename": filename}), encoding="utf-8")
+            _fsync(tmp)
             os.replace(tmp, meta)
+            _fsync(self.directory)  # the rename itself must reach the disk too
         except OSError:
             tmp.unlink(missing_ok=True)
+            meta.unlink(missing_ok=True)
             target.unlink(missing_ok=True)
             raise
         if prune:
@@ -121,6 +139,29 @@ class Spool:
         item.meta.unlink(missing_ok=True)
         item.image.unlink(missing_ok=True)
 
+    def reject(self, item: SpoolItem) -> None:
+        """Take an image that can never be sent out of the queue; sweep() deletes it later."""
+        os.replace(item.meta, item.meta.with_suffix(".rejected"))
+
+    def sweep(self, now: float | None = None) -> None:
+        """Delete leftovers older than STALE_S: every file that is not part of a readable pair.
+
+        That covers a JPEG without a sidecar (a run stopped inside add() or remove()), a sidecar
+        without a JPEG, damaged sidecars with their JPEG, ``*.tmp`` and rejected images. Only the
+        capture path calls this; ``status`` must never change the spool.
+        """
+        if not self.directory.is_dir():
+            return
+        cutoff = (time.time() if now is None else now) - STALE_S
+        try:
+            keep = {path for item in self.pending() for path in (item.image, item.meta)}
+            for path in self.directory.iterdir():
+                if path not in keep and path.is_file() and path.stat().st_mtime < cutoff:
+                    log.warning("removing stale spool file %s", path.name)
+                    path.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("could not clean the spool: %s", exc)
+
     def prune(self, *, keep: Path | None = None) -> None:
         if self.max_files <= 0:
             return
@@ -132,15 +173,20 @@ class Spool:
 
 
 @contextlib.contextmanager
-def locked(path: Path) -> Iterator[bool]:
-    """Non-blocking exclusive lock. Yields ``False`` when another run holds it."""
+def locked(path: Path, wait_s: float = 0.0) -> Iterator[bool]:
+    """Exclusive lock. Yields ``False`` when another run still holds it after ``wait_s`` seconds."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    give_up = time.monotonic() + wait_s
     with path.open("a+", encoding="utf-8") as fp:
-        try:
-            fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield False
-            return
+        while True:
+            try:
+                fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= give_up:
+                    yield False
+                    return
+                time.sleep(LOCK_POLL_S)
         fp.seek(0)
         fp.truncate()
         fp.write(str(os.getpid()))

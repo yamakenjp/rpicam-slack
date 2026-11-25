@@ -1,4 +1,7 @@
-from rpicam_slack.state import Spool, State, StateStore
+import os
+import threading
+
+from rpicam_slack.state import STALE_S, Spool, State, StateStore, locked
 
 
 def test_fresh_total_respects_age_and_validity():
@@ -75,3 +78,60 @@ def test_status_leaves_corrupt_and_legacy_entries_in_place(tmp_path):
     assert [item.filename for item in spool.pending()] == ["old.jpg"]
     assert (tmp_path / "1001-bad.jpg").read_bytes() == b"image"
     assert (tmp_path / "1001-bad.jpg.json").exists()
+
+
+def test_sweep_deletes_only_old_leftovers(tmp_path):
+    spool = Spool(tmp_path / "spool", max_files=5)
+    source = tmp_path / "photo.jpg"
+    source.write_bytes(b"capture")
+    kept = spool.add(source, "waiting", "kept.jpg", 1000)
+    refused = spool.add(source, "refused", "refused.jpg", 1001)
+    spool.reject(refused)
+    assert spool.pending() == [kept]  # a rejected image is no longer offered to Slack
+    leftovers = [refused.image, refused.meta.with_suffix(".rejected")]
+    for name in ["2-orphan.jpg", "3-lost.jpg.json", "4-bad.jpg", "4-bad.jpg.json", "5-half.jpg.tmp"]:
+        (spool.directory / name).write_text("{")
+        leftovers.append(spool.directory / name)
+    now = 1_000_000.0
+    for path in [kept.image, kept.meta, *leftovers]:
+        os.utime(path, (now - STALE_S - 60, now - STALE_S - 60))
+    fresh = spool.directory / "6-fresh.jpg"  # could belong to a run that has only just stopped
+    fresh.write_bytes(b"copy")
+    os.utime(fresh, (now - 60, now - 60))
+
+    spool.pending()  # what status does: it must leave everything in place
+    assert all(path.exists() for path in leftovers)
+    spool.sweep(now)
+    assert sorted(p.name for p in spool.directory.iterdir()) == sorted(
+        [kept.image.name, kept.meta.name, fresh.name]
+    )
+
+
+def test_add_flushes_the_copy_to_the_disk(tmp_path, monkeypatch):
+    synced: list[int] = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd))[1])
+    source = tmp_path / "photo.jpg"
+    source.write_bytes(b"capture")
+    Spool(tmp_path / "spool", max_files=2).add(source, "comment", "photo.jpg", 1000)
+    assert len(synced) == 3  # the JPEG, the sidecar and the directory entry
+
+
+def test_lock_can_wait_for_the_holder_to_finish(tmp_path):
+    path = tmp_path / "lock"
+    holding, release = threading.Event(), threading.Event()
+
+    def hold():
+        with locked(path):
+            holding.set()
+            release.wait(5)
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    assert holding.wait(5)
+    with locked(path) as acquired:
+        assert not acquired  # no waiting unless asked for
+    threading.Timer(0.2, release.set).start()
+    with locked(path, 5) as acquired:
+        assert acquired
+    thread.join()

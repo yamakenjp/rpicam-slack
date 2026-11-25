@@ -6,6 +6,7 @@ import pytest
 from rpicam_slack.camera import ShotResult
 from rpicam_slack.exposure import ImageStats
 from rpicam_slack.focus import focus_scan, recommend, scan_positions, spread
+from rpicam_slack.state import locked
 from tests.conftest import make_config
 
 
@@ -58,3 +59,23 @@ def test_scanning_in_daylight_does_not_warn(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="rpicam_slack.focus"):
         focus_scan(cfg, FocusCamera(), [0.0, 1.0], tmp_path, measure=bright)
     assert caplog.text == ""
+
+
+def test_the_lock_is_held_for_each_shot_and_free_in_between(tmp_path, monkeypatch):
+    cfg = make_config(tmp_path)
+    lock = tmp_path / "lock"
+    seen: list[tuple[str, bool]] = []
+
+    def free() -> bool:
+        with locked(lock) as acquired:
+            return acquired
+
+    class Camera(FocusCamera):
+        def shoot(self, shot, image: Path, *, timeout_s: float) -> ShotResult:
+            seen.append(("shot", free()))
+            return super().shoot(shot, image, timeout_s=timeout_s)
+
+    monkeypatch.setattr("rpicam_slack.focus.time.sleep", lambda seconds: seen.append(("gap", free())))
+    results = focus_scan(cfg, Camera(), [0.0, 1.0, 2.0], tmp_path, lock=lock)
+    assert [fom for _, fom in results] == [2000.0, 2001.0, 2002.0]
+    assert seen == [("shot", False), ("gap", True), ("shot", False), ("gap", True), ("shot", False)]

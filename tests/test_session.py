@@ -1,5 +1,7 @@
 """End-to-end behaviour of one run, against the scene simulator."""
 
+import threading
+
 import pytest
 
 from rpicam_slack.session import (
@@ -315,3 +317,83 @@ def test_bad_spooled_files_do_not_block_a_later_good_file(rig, tmp_path, monkeyp
     assert run(r) == EXIT_OK
     assert r.uploader.uploads[-1] == ("ok.jpg", "[late] ok.jpg")
     assert [it.filename for it in r.spool.pending()] == ["bad1.jpg", "bad2.jpg", "bad3.jpg"]
+
+
+def test_a_file_that_slack_refuses_is_offered_only_once(rig, tmp_path, monkeypatch):
+    r = rig(DAY)
+    image = tmp_path / "image.jpg"
+    image.write_bytes(b"frame")
+    for i, filename in enumerate(["refused.jpg", "ok.jpg"]):
+        r.spool.add(image, filename, filename, i)
+    offered = []
+    upload = r.uploader.upload
+
+    def refuse(path, comment, filename, *, deadline):
+        offered.append(filename)
+        if filename == "refused.jpg":
+            raise UploadFileError("file rejected: slack error file_type_not_allowed", permanent=True)
+        upload(path, comment, filename, deadline=deadline)
+
+    monkeypatch.setattr(r.uploader, "upload", refuse)
+    assert run(r) == EXIT_OK
+    r.advance(900)
+    assert run(r) == EXIT_OK
+    assert offered.count("refused.jpg") == 1 and offered.count("ok.jpg") == 1
+    assert r.spool.pending() == []
+
+
+def test_no_resend_starts_without_the_time_for_one_upload(rig, tmp_path, monkeypatch):
+    r = rig(DAY)
+    image = tmp_path / "image.jpg"
+    image.write_bytes(b"frame")
+    r.spool.add(image, "old", "old.jpg", 1)
+    upload = r.uploader.upload
+
+    def slow(path, comment, filename, *, deadline):
+        upload(path, comment, filename, deadline=deadline)
+        r.clock.advance(deadline - r.clock() - r.cfg.slack.timeout_s)  # less than timeout_s + 5 is left
+
+    monkeypatch.setattr(r.uploader, "upload", slow)
+    assert run(r) == EXIT_OK
+    assert len(r.uploader.uploads) == 1  # only the fresh picture
+    assert [item.filename for item in r.spool.pending()] == ["old.jpg"]
+
+
+def test_waiting_for_slack_is_capped_and_raises_no_alert(rig, monkeypatch):
+    r = rig(DAY)
+
+    def rate_limit(*args, **kwargs):
+        raise UploadError("429", retry_after_s=86400)
+
+    with monkeypatch.context() as m:
+        m.setattr(r.uploader, "upload", rate_limit)
+        assert run(r) == EXIT_UPLOAD_DEFERRED
+    state = r.store.load()
+    assert 0 < state.upload_not_before_epoch - r.deps().wall().timestamp() <= 3600
+    r.advance(900)
+    assert run(r) == EXIT_UPLOAD_DEFERRED  # still waiting: counted as a failure, but Slack is left alone
+    assert r.store.load().consecutive_failures == 2 and r.uploader.alerts == []
+
+    state = r.store.load()
+    state.upload_not_before_epoch += 10 * 86400  # as if the clock had since been set back by ten days
+    r.store.save(state)
+    assert run(r) == EXIT_OK
+
+
+def test_a_capture_waits_for_a_focus_scan_shot_instead_of_being_skipped(rig):
+    r = rig(DAY)
+    path = r.cfg.paths.state_path / "lock"
+    holding, release = threading.Event(), threading.Event()
+
+    def scan_shot():
+        with locked(path):
+            holding.set()
+            release.wait(5)
+
+    thread = threading.Thread(target=scan_shot)
+    thread.start()
+    assert holding.wait(5)
+    threading.Timer(0.2, release.set).start()
+    assert run_locked(r.cfg, r.deps(), 5) == EXIT_OK
+    thread.join()
+    assert r.camera.shots  # taken as soon as the shot in progress had finished

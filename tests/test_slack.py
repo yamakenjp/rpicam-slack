@@ -1,4 +1,5 @@
 import time
+from contextlib import contextmanager
 
 import pytest
 from slack_sdk.errors import SlackApiError
@@ -135,3 +136,45 @@ def test_alert_never_raises():
     assert ok.messages == [{"channel": "C123", "text": "hello"}]
     broken = FakeClient([api_error("invalid_auth")])
     assert uploader(broken, []).alert("hello") is False
+
+
+def test_retry_after_is_found_whatever_the_case_of_the_header_name(image):
+    client = FakeClient([api_error("ratelimited", 429, {"Retry-after": "9"})])
+    sleeps: list[float] = []
+    uploader(client, sleeps).upload(image, "c", "f.jpg")
+    assert sleeps == [9.0]
+
+
+def test_at_least_one_attempt_is_required():
+    with pytest.raises(ValueError):
+        SlackUploader("xoxb-token", "C123", retries=0)
+
+
+def test_only_files_that_can_never_be_sent_are_permanent(tmp_path, image):
+    empty = tmp_path / "empty.jpg"
+    empty.write_bytes(b"")
+    refused = FakeClient([api_error("file_type_not_allowed")])
+    cases = [
+        (refused, image, True),
+        (FakeClient([]), empty, True),
+        (FakeClient([]), tmp_path / "no.jpg", False),
+    ]
+    for client, path, permanent in cases:
+        with pytest.raises(UploadFileError) as info:
+            uploader(client, []).upload(path, "c", "f.jpg")
+        assert info.value.permanent is permanent
+    assert len(refused.uploads) == 1
+
+
+def test_a_timer_that_fires_after_slack_answered_does_not_fail_the_upload(image, monkeypatch):
+    client = FakeClient([])
+    up = uploader(client, [])
+
+    @contextmanager
+    def late_alarm(deadline):
+        yield client
+        raise UploadDeadline("Slack time budget exhausted")
+
+    monkeypatch.setattr(up, "_client", late_alarm)
+    up.upload(image, "c", "f.jpg", deadline=time.monotonic() + 5)
+    assert len(client.uploads) == 1
