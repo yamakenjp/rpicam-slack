@@ -3,6 +3,7 @@ import json
 import pytest
 
 from rpicam_slack.cli import main
+from rpicam_slack.state import locked
 
 
 def write_config(tmp_path, fake_command, extra=""):
@@ -86,6 +87,26 @@ def test_focus_scan_recommends_the_sharpest_position(tmp_path, fake_rpicam, caps
 def test_focus_scan_rejects_a_bad_range(tmp_path, fake_rpicam):
     config = write_config(tmp_path, fake_rpicam)
     assert main(["focus-scan", "--config", config, "--start", "3", "--end", "1"]) == 2
+
+
+def test_focus_scan_respects_the_capture_lock(tmp_path, fake_rpicam, monkeypatch):
+    config = write_config(tmp_path, fake_rpicam)
+    monkeypatch.setattr("rpicam_slack.cli.focus_scan", lambda *args: pytest.fail("scan touched the camera"))
+    with locked(tmp_path / "state" / "lock") as acquired:
+        assert acquired
+        assert main(["focus-scan", "--config", config]) == 1
+
+
+@pytest.mark.parametrize("template", ["{gain:.2f}", "{}", "{timestamp", "{camera!z}"])
+def test_check_rejects_invalid_formats_before_capture(tmp_path, fake_rpicam, template, capsys):
+    path = tmp_path / "slack_option"
+    path.write_text(f"SLACK_TOKEN=t\nCHANNEL=C1\nCOMMENT_TEMPLATE={template}\n")
+    path.chmod(0o600)
+    args = ["--config", write_config(tmp_path, fake_rpicam), "--slack-option", str(path)]
+    assert main(["check", *args]) == 2
+    assert "invalid COMMENT_TEMPLATE" in capsys.readouterr().out
+    assert main(["capture", *args]) == 2
+    assert not (tmp_path / "state" / "state.json").exists()
 
 
 def test_version(capsys):

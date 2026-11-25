@@ -25,6 +25,8 @@ def test_unusable_results():
     assert recommend([]) is None
     assert recommend([(0.0, None), (1.0, None)]) is None
     assert spread([(0.0, 5.0)]) is None
+    assert recommend([(0.0, 0.0), (4.0, 0.0), (8.0, 0.0)]) is None
+    assert recommend([(0.0, None), (4.0, 1200.0)]) is None
 
 
 def test_scan_positions():

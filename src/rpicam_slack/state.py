@@ -7,9 +7,11 @@ import fcntl
 import json
 import logging
 import os
+import shutil
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
+from uuid import uuid4
 
 log = logging.getLogger(__name__)
 
@@ -25,6 +27,7 @@ class State:
     consecutive_failures: int = 0
     last_error: str = ""
     last_alert_epoch: float = 0.0
+    upload_not_before_epoch: float = 0.0  # Slack Retry-After, shared by fresh and queued uploads
     frame_ratio: float = 0.0  # observed (elapsed / shutter) of long exposures
 
     def fresh_total(self, now_epoch: float, max_age_min: int) -> float | None:
@@ -74,17 +77,30 @@ class Spool:
         self.directory = directory
         self.max_files = max_files
 
-    def add(self, image: Path, comment: str, filename: str, taken_epoch: float) -> None:
+    def add(
+        self, image: Path, comment: str, filename: str, taken_epoch: float, *, prune: bool = True
+    ) -> SpoolItem | None:
         if self.max_files <= 0:
-            return
+            return None
         self.directory.mkdir(parents=True, exist_ok=True)
-        stem = f"{int(taken_epoch)}-{filename}"
-        target = self.directory / stem
-        target.write_bytes(image.read_bytes())
-        target.with_name(stem + ".json").write_text(
-            json.dumps({"comment": comment, "filename": filename}), encoding="utf-8"
-        )
-        self._prune()
+        if not prune:
+            # A previous process may have stopped with its in-flight slot occupied.
+            self.prune()
+        # The sidecar is the commit marker. Readers see the pair only after the JPEG is complete.
+        target = self.directory / f"{int(taken_epoch)}-{uuid4().hex}.jpg"
+        meta = target.with_suffix(".jpg.json")
+        tmp = meta.with_suffix(".tmp")
+        try:
+            shutil.copyfile(image, target)
+            tmp.write_text(json.dumps({"comment": comment, "filename": filename}), encoding="utf-8")
+            os.replace(tmp, meta)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            target.unlink(missing_ok=True)
+            raise
+        if prune:
+            self.prune(keep=target)
+        return SpoolItem(target, meta, comment, filename)
 
     def pending(self) -> list[SpoolItem]:
         if not self.directory.is_dir():
@@ -92,25 +108,25 @@ class Spool:
         items: list[SpoolItem] = []
         for meta in sorted(self.directory.glob("*.json")):
             image = meta.with_suffix("")
-            if not image.exists():
-                meta.unlink(missing_ok=True)
-                continue
             try:
+                if not image.is_file():
+                    continue
                 info = json.loads(meta.read_text(encoding="utf-8"))
                 items.append(SpoolItem(image, meta, str(info["comment"]), str(info["filename"])))
-            except (OSError, ValueError, KeyError):
-                log.warning("dropping corrupt spool entry %s", meta)
-                meta.unlink(missing_ok=True)
-                image.unlink(missing_ok=True)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                log.warning("cannot read spool entry %s: %s", meta, exc)
         return items
 
     def remove(self, item: SpoolItem) -> None:
-        item.image.unlink(missing_ok=True)
         item.meta.unlink(missing_ok=True)
+        item.image.unlink(missing_ok=True)
 
-    def _prune(self) -> None:
+    def prune(self, *, keep: Path | None = None) -> None:
+        if self.max_files <= 0:
+            return
         items = self.pending()
-        for item in items[: max(0, len(items) - self.max_files)]:
+        oldest = [item for item in items if item.image != keep]
+        for item in oldest[: max(0, len(items) - self.max_files)]:
             log.warning("spool full; dropping oldest image %s", item.filename)
             self.remove(item)
 

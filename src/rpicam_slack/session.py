@@ -36,14 +36,15 @@ from .exposure import (
     plan_exposure,
     shot_cost_s,
 )
-from .slack import Uploader, UploadError
-from .state import Spool, State, StateStore, locked
+from .slack import Uploader, UploadError, UploadFileError
+from .state import Spool, SpoolItem, State, StateStore, locked
 
 log = logging.getLogger(__name__)
 
 EXIT_OK = 0
 EXIT_CAMERA = 1
 EXIT_CONFIG = 2
+EXIT_UPLOAD_FAILED = 3  # upload failed and no durable copy is available for retry
 EXIT_UPLOAD_DEFERRED = 75  # EX_TEMPFAIL: the image is spooled and will be retried
 MAX_SPOOL_FLUSH = 3
 AE_ASSUMED_SHUTTER_S = 0.07  # auto exposure stays near one frame time
@@ -181,7 +182,8 @@ class CaptureSession:
     ) -> tuple[ShotResult, Exposure, bool]:
         cfg, ex, b = self.cfg, self.cfg.exposure, self.cfg.budget
         if trials:
-            best = min(trials, key=lambda t: abs(t.stats.luma - effective_target(ex)))
+            # At saturation several frames can tie while exposure is still moving toward the target.
+            best = min(reversed(trials), key=lambda t: abs(t.stats.luma - effective_target(ex)))
             final_total = next_total(best.total, best.stats, ex)
         else:
             hint = self.state.fresh_total(now_epoch, ex.state_max_age_min)
@@ -261,33 +263,74 @@ class CaptureSession:
             return
         if epoch - self.state.last_alert_epoch < s.alert_min_interval_min * 60:
             return
-        if self.d.uploader.alert(f":warning: {self.cfg.camera_name}: {text}"):
+        if self.d.uploader.alert(f":warning: {self.cfg.camera_name}: {text}", deadline=deadline):
             self.state.last_alert_epoch = epoch
+            self._save_state()
 
     def _fail(self, kind: str, message: str, deadline: float) -> None:
         self.state.consecutive_failures += 1
         self.state.last_error = f"{kind}: {message}"
         log.error("%s failure (%d in a row): %s", kind, self.state.consecutive_failures, message)
+        self._save_state()
         self._alert(
             f"{kind} failure, {self.state.consecutive_failures} run(s) in a row: {message}",
             deadline,
         )
-        self._save_state()
+
+    def _record_retry_after(self, exc: UploadError) -> None:
+        if exc.retry_after_s is not None:
+            self.state.upload_not_before_epoch = self.d.wall().timestamp() + exc.retry_after_s
+            self._save_state()
+
+    def _post(
+        self, result: ShotResult, comment: str, filename: str, taken: datetime, deadline: float
+    ) -> tuple[int, SpoolItem | None]:
+        d = self.d
+        assert d.uploader is not None
+        item = None
+        try:
+            # Keep the in-flight frame in addition to the bounded backlog until its outcome is known.
+            item = d.spool.add(result.image, comment, filename, taken.timestamp(), prune=False)
+        except OSError as exc:
+            log.error("could not stage %s for retry: %s", filename, exc)
+        try:
+            wait = self.state.upload_not_before_epoch - d.wall().timestamp()
+            if wait > 0:
+                raise UploadError(f"Slack Retry-After has {wait:.0f}s remaining")
+            d.uploader.upload(item.image if item else result.image, comment, filename, deadline=deadline)
+        except UploadError as exc:
+            self._record_retry_after(exc)
+            self._fail("upload", str(exc), deadline)
+            if item is None:
+                return EXIT_UPLOAD_FAILED, None
+            try:
+                d.spool.prune(keep=item.image)
+            except OSError as prune_error:
+                log.warning("could not trim spool: %s", prune_error)
+            return EXIT_UPLOAD_DEFERRED, None
+        self.state.upload_not_before_epoch = 0.0
+        return EXIT_OK, item
 
     def _flush_spool(self, deadline: float) -> None:
         uploader = self.d.uploader
         if uploader is None:
             return
-        for item in self.d.spool.pending()[:MAX_SPOOL_FLUSH]:
-            if self._remaining(deadline) < self.cfg.slack.timeout_s + 5:
+        sent = 0
+        for item in self.d.spool.pending():
+            if sent >= MAX_SPOOL_FLUSH or self._remaining(deadline) <= 0:
                 return
             try:
-                uploader.upload(item.image, f"[late] {item.comment}", item.filename)
+                uploader.upload(item.image, f"[late] {item.comment}", item.filename, deadline=deadline)
+            except UploadFileError as exc:
+                log.warning("skipping spooled image %s: %s", item.filename, exc)
+                continue
             except UploadError as exc:
+                self._record_retry_after(exc)
                 log.warning("spooled image %s still cannot be uploaded: %s", item.filename, exc)
                 return
             log.info("uploaded spooled image %s", item.filename)
             self.d.spool.remove(item)
+            sent += 1
 
     # --------------------------------------------------------------------- run
 
@@ -342,12 +385,9 @@ class CaptureSession:
                 self._save_state()
                 return EXIT_OK
 
-            try:
-                d.uploader.upload(result.image, comment, filename)
-            except UploadError as exc:
-                d.spool.add(result.image, comment, filename, now.timestamp())
-                self._fail("upload", str(exc), deadline)
-                return EXIT_UPLOAD_DEFERRED
+            outcome, posted = self._post(result, comment, filename, now, deadline)
+            if outcome != EXIT_OK:
+                return outcome
 
         # Uploaded. Housekeeping must never turn a successful run into a failure.
         recovered = self.state.consecutive_failures >= cfg.slack.alert_after_failures
@@ -357,11 +397,16 @@ class CaptureSession:
         self.state.last_error = ""
         self.state.last_success_epoch = now.timestamp()
         try:
+            if posted is not None:
+                d.spool.remove(posted)
             self._flush_spool(deadline)
             if recovered and was_alerted and cfg.slack.alert_recovery and d.uploader:
                 d.uploader.alert(
-                    f":white_check_mark: {cfg.camera_name}: recovered after {failures} failed run(s)"
+                    f":white_check_mark: {cfg.camera_name}: recovered after {failures} failed run(s)",
+                    deadline=deadline,
                 )
+        except OSError as exc:
+            log.warning("could not finish spool housekeeping: %s", exc)
         finally:
             if recovered:
                 self.state.last_alert_epoch = 0.0

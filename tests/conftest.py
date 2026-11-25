@@ -97,14 +97,14 @@ class FakeUploader:
         self.alerts: list[str] = []
         self.fail_uploads = 0
 
-    def upload(self, path: Path, comment: str, filename: str) -> None:
+    def upload(self, path: Path, comment: str, filename: str, *, deadline: float | None = None) -> None:
         if self.fail_uploads > 0:
             self.fail_uploads -= 1
             raise UploadError("network is down")
         assert Path(path).exists()
         self.uploads.append((filename, comment))
 
-    def alert(self, text: str) -> bool:
+    def alert(self, text: str, *, deadline: float | None = None) -> bool:
         self.alerts.append(text)
         return True
 

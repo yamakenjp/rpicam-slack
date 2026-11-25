@@ -6,9 +6,11 @@ from rpicam_slack.session import (
     EXIT_CAMERA,
     EXIT_OK,
     EXIT_UPLOAD_DEFERRED,
+    EXIT_UPLOAD_FAILED,
     CaptureSession,
     run_locked,
 )
+from rpicam_slack.slack import UploadError, UploadFileError
 from rpicam_slack.state import locked
 
 DAY = 100.0  # bright: ~2 ms equivalent exposure
@@ -214,3 +216,102 @@ def test_a_longer_preview_for_long_exposures_stays_within_the_budget(rig):
     final = r.camera.shots[-1]
     assert final.preview_ms == round(1.5 * final.shutter_us / 1000)
     assert final.preview_ms > r.cfg.exposure.final_preview_ms
+
+
+def test_lights_switch_on_after_a_night_capture(rig):
+    r = rig(NIGHT)
+    assert run(r) == EXIT_OK
+    r.advance(900)
+    r.camera.k = 20
+    start = len(r.camera.shots)
+    assert run(r) == EXIT_OK
+    trials = r.camera.shots[start:-1]
+    totals = [s.shutter_us / 1e6 * s.gain for s in trials]
+    assert len(trials) == 4
+    assert totals == sorted(totals, reverse=True)
+    assert r.store.load().last_total_s < totals[-1]
+    assert r.camera.last_luma < 200
+
+
+def test_interrupted_current_upload_remains_available_to_next_run(rig, monkeypatch):
+    r = rig(DAY)
+
+    def stop_after_staging(path, comment, filename, *, deadline):
+        [item] = r.spool.pending()
+        assert (item.image, item.comment, item.filename) == (path, comment, filename)
+        assert item.image.stat().st_size > 0 and deadline > r.clock()
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as m:
+        m.setattr(r.uploader, "upload", stop_after_staging)
+        with pytest.raises(KeyboardInterrupt):
+            run(r)
+    [interrupted] = r.spool.pending()
+    r.advance(900)
+    assert run(r) == EXIT_OK
+    assert r.uploader.uploads[-1] == (interrupted.filename, f"[late] {interrupted.comment}")
+    assert r.spool.pending() == []
+
+
+def test_current_success_preserves_a_full_backlog(rig, tmp_path):
+    r = rig(DAY, paths={"spool_max_files": 1})
+    image = tmp_path / "old.jpg"
+    image.write_bytes(b"old")
+    r.spool.add(image, "old comment", "old.jpg", 1)
+    assert run(r) == EXIT_OK
+    assert r.uploader.uploads[-1] == ("old.jpg", "[late] old comment")
+
+
+def test_upload_failure_status_requires_a_durable_copy(rig, monkeypatch):
+    r = rig(DAY, paths={"spool_max_files": 0})
+    r.uploader.fail_uploads = 1
+    assert run(r) == EXIT_UPLOAD_FAILED
+    assert r.spool.pending() == []
+    assert r.store.load().consecutive_failures == 1
+
+    def full_disk(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(r.spool, "add", full_disk)
+    r.uploader.fail_uploads = 1
+    assert run(r) == EXIT_UPLOAD_FAILED
+    assert run(r) == EXIT_OK  # the temporary JPEG can still be sent when staging is unavailable
+
+
+def test_rate_limit_survives_a_restart_and_applies_to_new_captures(rig, monkeypatch):
+    r = rig(DAY)
+
+    def rate_limit(*args, **kwargs):
+        raise UploadError("429", retry_after_s=1500)
+
+    with monkeypatch.context() as m:
+        m.setattr(r.uploader, "upload", rate_limit)
+        assert run(r) == EXIT_UPLOAD_DEFERRED
+    assert r.store.load().upload_not_before_epoch > 0
+    r.advance(900)
+    assert run(r) == EXIT_UPLOAD_DEFERRED
+    assert r.uploader.uploads == []
+    assert len(r.spool.pending()) == 2
+    r.advance(900)
+    assert run(r) == EXIT_OK
+    assert len(r.uploader.uploads) == 3 and r.spool.pending() == []
+    assert r.store.load().upload_not_before_epoch == 0
+
+
+def test_bad_spooled_files_do_not_block_a_later_good_file(rig, tmp_path, monkeypatch):
+    r = rig(DAY)
+    image = tmp_path / "image.jpg"
+    image.write_bytes(b"frame")
+    for i, filename in enumerate(["bad1.jpg", "bad2.jpg", "bad3.jpg", "ok.jpg"]):
+        r.spool.add(image, filename, filename, i)
+    upload = r.uploader.upload
+
+    def reject_bad(path, comment, filename, *, deadline):
+        if filename.startswith("bad"):
+            raise UploadFileError("unreadable")
+        upload(path, comment, filename, deadline=deadline)
+
+    monkeypatch.setattr(r.uploader, "upload", reject_bad)
+    assert run(r) == EXIT_OK
+    assert r.uploader.uploads[-1] == ("ok.jpg", "[late] ok.jpg")
+    assert [it.filename for it in r.spool.pending()] == ["bad1.jpg", "bad2.jpg", "bad3.jpg"]

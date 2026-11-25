@@ -44,5 +44,34 @@ def test_spool_ignores_orphans_and_can_be_disabled(tmp_path):
     spool = Spool(tmp_path / "spool2", max_files=5)
     spool.directory.mkdir()
     (spool.directory / "1-lost.jpg.json").write_text('{"comment": "c", "filename": "lost.jpg"}')
-    assert spool.pending() == []  # metadata without an image is cleaned up
-    assert list(spool.directory.iterdir()) == []
+    assert spool.pending() == []
+    assert (spool.directory / "1-lost.jpg.json").exists()  # status never changes the spool
+
+
+def test_spool_only_publishes_complete_pairs(tmp_path, monkeypatch):
+    import os
+
+    spool = Spool(tmp_path / "spool", max_files=2)
+    source = tmp_path / "photo.jpg"
+    source.write_bytes(b"capture")
+    original_replace = os.replace
+
+    def inspect_before_publish(src, dst):
+        assert spool.pending() == []
+        assert dst.with_suffix("").read_bytes() == b"capture"
+        original_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", inspect_before_publish)
+    item = spool.add(source, "comment", "photo.jpg", 1000)
+    assert spool.pending() == [item]
+
+
+def test_status_leaves_corrupt_and_legacy_entries_in_place(tmp_path):
+    spool = Spool(tmp_path, max_files=2)
+    (tmp_path / "1000-old.jpg").write_bytes(b"legacy")
+    (tmp_path / "1000-old.jpg.json").write_text('{"comment":"old","filename":"old.jpg"}')
+    (tmp_path / "1001-bad.jpg").write_bytes(b"image")
+    (tmp_path / "1001-bad.jpg.json").write_text("{")
+    assert [item.filename for item in spool.pending()] == ["old.jpg"]
+    assert (tmp_path / "1001-bad.jpg").read_bytes() == b"image"
+    assert (tmp_path / "1001-bad.jpg.json").exists()

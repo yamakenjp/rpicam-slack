@@ -78,9 +78,7 @@ def spread(results: list[tuple[float, float | None]]) -> float | None:
 def recommend(results: list[tuple[float, float | None]], min_spread: float = MIN_SPREAD) -> float | None:
     """The sharpest lens position, or ``None`` when the curve is too flat to trust."""
     scored = [(fom, position) for position, fom in results if fom is not None]
-    if not scored:
-        return None
     variation = spread(results)
-    if variation is not None and variation < min_spread:
+    if variation is None or variation < min_spread:
         return None
     return max(scored)[1]

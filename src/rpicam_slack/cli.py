@@ -33,7 +33,7 @@ from .exposure import plan_exposure
 from .focus import focus_scan, recommend, scan_positions, spread
 from .session import EXIT_CAMERA, EXIT_CONFIG, EXIT_OK, Deps, run_locked, test_shot
 from .slack import SlackUploader
-from .state import Spool, StateStore
+from .state import Spool, StateStore, locked
 
 log = logging.getLogger("rpicam_slack")
 
@@ -124,8 +124,12 @@ def cmd_focus_scan(args: argparse.Namespace) -> int:
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
     camera = RpicamStill(cfg.camera)
-    with tempfile.TemporaryDirectory(prefix="rpicam-slack-focus-") as tmp:
-        results = focus_scan(cfg, camera, positions, Path(tmp))
+    with locked(cfg.paths.state_path / "lock") as acquired:
+        if not acquired:
+            log.error("camera is busy; retry the focus scan after the current capture")
+            return EXIT_CAMERA
+        with tempfile.TemporaryDirectory(prefix="rpicam-slack-focus-") as tmp:
+            results = focus_scan(cfg, camera, positions, Path(tmp))
     print(f"{'lens_position':>14}  FocusFoM")
     for position, fom in results:
         print(f"{position:>14.2f}  {'-' if fom is None else f'{fom:.1f}'}")
